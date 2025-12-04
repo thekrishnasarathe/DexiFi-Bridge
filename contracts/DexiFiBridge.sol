@@ -1,217 +1,101 @@
-State variables
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+/**
+ * @title DexiFi Bridge
+ * @notice A cross-chain asset bridge that locks tokens on the source chain
+ *         and mints wrapped tokens on the destination chain. For reverse transfers,
+ *         wrapped tokens are burned to unlock locked original assets.
+ */
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from,address to,uint256 amount) external returns (bool);
+    function mint(address to, uint256 amount) external;
+    function burn(address from, uint256 amount) external;
+}
+
+contract DexiFiBridge {
     address public owner;
-    uint256 public bridgeFee; Supported chains mapping
-    mapping(uint256 => bool) public supportedChains;
-    
-    User balances locked in bridge
-    mapping(address => mapping(address => uint256)) public lockedBalances;
-    
-    Events
-    event BridgeInitiated(
-        bytes32 indexed txId,
-        address indexed sender,
-        address indexed recipient,
-        address token,
-        uint256 amount,
-        uint256 sourceChain,
-        uint256 destinationChain
-    );
-    
-    event BridgeCompleted(bytes32 indexed txId, address indexed recipient);
-    event BridgeCancelled(bytes32 indexed txId);
-    event ChainAdded(uint256 indexed chainId);
-    event ChainRemoved(uint256 indexed chainId);
-    event RelayerAdded(address indexed relayer);
-    event RelayerRemoved(address indexed relayer);
-    event FeeUpdated(uint256 newFee);
-    event Paused();
-    event Unpaused();
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    
-    Modifiers
+
+    struct LockRecord {
+        address token;
+        address user;
+        uint256 amount;
+        uint256 timestamp;
+        bool processed;
+    }
+
+    mapping(uint256 => LockRecord) public lockRecords;
+    uint256 public lockId;
+
+    event Locked(uint256 indexed lockId, address indexed user, address token, uint256 amount);
+    event Minted(address indexed user, address token, uint256 amount);
+    event Burned(address indexed user, address token, uint256 amount);
+    event Unlocked(address indexed user, address token, uint256 amount);
+
     modifier onlyOwner() {
-        if (msg.sender != owner) revert Unauthorized();
+        require(msg.sender == owner, "Admin only");
         _;
     }
-    
-    modifier onlyRelayer() {
-        if (!relayers[msg.sender]) revert Unauthorized();
-        _;
-    }
-    
-    modifier whenNotPaused() {
-        if (paused) revert ContractPaused();
-        _;
-    }
-    
+
     constructor() {
         owner = msg.sender;
-        bridgeFee = 50; Handle native ETH vs ERC20 tokens
-        if (token == address(0)) {
-            ERC20 token bridge
-            if (!IERC20(token).transferFrom(msg.sender, address(this), amount)) {
-                revert TokenTransferFailed();
-            }
-        }
-        
-        uint256 fee = (amount * bridgeFee) / 10000;
-        uint256 netAmount;
-        unchecked {
-            netAmount = amount - fee;
-        }
-        
-        bytes32 txId = keccak256(
-            abi.encodePacked(
-                msg.sender,
-                recipient,
-                token,
-                amount,
-                block.chainid,
-                destinationChain,
-                block.timestamp,
-                totalTransactions
-            )
-        );
-        
-        transactions[txId] = BridgeTransaction({
-            sender: msg.sender,
-            recipient: recipient,
-            token: token,
-            amount: netAmount,
-            sourceChain: block.chainid,
-            destinationChain: destinationChain,
-            timestamp: block.timestamp,
-            status: TransactionStatus.Pending
-        });
-        
-        unchecked {
-            lockedBalances[msg.sender][token] += amount;
-            totalTransactions++;
-        }
-        
-        emit BridgeInitiated(
-            txId,
-            msg.sender,
-            recipient,
+    }
+
+    /**
+     * @notice Source chain: lock original tokens before bridging
+     */
+    function lockTokens(address token, uint256 amount) external {
+        require(amount > 0, "Amount > 0 required");
+
+        IERC20(token).transferFrom(msg.sender, address(this), amount);
+
+        lockId++;
+        lockRecords[lockId] = LockRecord(
             token,
-            netAmount,
-            block.chainid,
-            destinationChain
+            msg.sender,
+            amount,
+            block.timestamp,
+            false
         );
-        
-        return txId;
+
+        emit Locked(lockId, msg.sender, token, amount);
     }
-    
+
     /**
-     * @dev Function 2: Complete a bridge transfer (relayer only)
-     * @param txId Transaction ID to complete
+     * @notice Destination chain: admin mints wrapped tokens equivalent to locked originals
      */
-    function completeBridge(bytes32 txId) external onlyRelayer {
-        BridgeTransaction storage txn = transactions[txId];
-        if (txn.status != TransactionStatus.Pending) revert TransactionNotPending();
-        
-        txn.status = TransactionStatus.Completed;
-        
-        emit BridgeCompleted(txId, txn.recipient);
+    function mintWrapped(address wrappedToken, address user, uint256 amount) external onlyOwner {
+        IERC20(wrappedToken).mint(user, amount);
+        emit Minted(user, wrappedToken, amount);
     }
-    
+
     /**
-     * @dev Function 3: Cancel a pending bridge transaction
-     * @param txId Transaction ID to cancel
+     * @notice Destination chain: users burn wrapped to request unlock on source chain
      */
-    function cancelBridge(bytes32 txId) external {
-        BridgeTransaction storage txn = transactions[txId];
-        if (msg.sender != txn.sender && msg.sender != owner) revert Unauthorized();
-        if (txn.status != TransactionStatus.Pending) revert TransactionNotPending();
-        
-        txn.status = TransactionStatus.Cancelled;
-        
-        uint256 refundAmount;
-        unchecked {
-            refundAmount = txn.amount + ((txn.amount * bridgeFee) / (10000 - bridgeFee));
-            lockedBalances[txn.sender][txn.token] -= refundAmount;
-        }
-        
-        Refund native ETH
-            payable(txn.sender).transfer(refundAmount);
-        } else {
-            Max 10%
-        bridgeFee = newFee;
-        emit FeeUpdated(newFee);
+    function burnWrapped(address wrappedToken, uint256 amount) external {
+        IERC20(wrappedToken).burn(msg.sender, amount);
+        emit Burned(msg.sender, wrappedToken, amount);
     }
-    
+
     /**
-     * @dev Function 9: Pause the bridge
+     * @notice Source chain: admin unlocks locked originals after receiving burn proof
      */
-    function pause() external onlyOwner {
-        paused = true;
-        emit Paused();
+    function unlockOriginal(uint256 _lockId, address user) external onlyOwner {
+        LockRecord storage record = lockRecords[_lockId];
+        require(!record.processed, "Already unlocked");
+
+        record.processed = true;
+        IERC20(record.token).transfer(user, record.amount);
+
+        emit Unlocked(user, record.token, record.amount);
     }
-    
+
     /**
-     * @dev Function 10: Unpause the bridge
+     * @notice View lock record
      */
-    function unpause() external onlyOwner {
-        paused = false;
-        emit Unpaused();
-    }
-    
-    /**
-     * @dev Transfer ownership to a new address
-     * @param newOwner Address of the new owner
-     */
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert InvalidRecipient();
-        
-        address previousOwner = owner;
-        owner = newOwner;
-        
-        emit OwnershipTransferred(previousOwner, newOwner);
-    }
-    
-    /**
-     * @dev Get transaction details
-     * @param txId Transaction ID
-     */
-    function getTransaction(bytes32 txId) external view returns (BridgeTransaction memory) {
-        return transactions[txId];
-    }
-    
-    /**
-     * @dev Check if chain is supported
-     * @param chainId Chain ID to check
-     */
-    function isChainSupported(uint256 chainId) external view returns (bool) {
-        return supportedChains[chainId];
-    }
-    
-    /**
-     * @dev Get locked balance for user and token
-     * @param user User address
-     * @param token Token address
-     */
-    function getLockedBalance(address user, address token) external view returns (uint256) {
-        return lockedBalances[user][token];
-    }
-    
-    /**
-     * @dev Get contract balance for a specific token
-     * @param token Token address (address(0) for ETH)
-     */
-    function getContractBalance(address token) external view returns (uint256) {
-        if (token == address(0)) {
-            return address(this).balance;
-        }
-        return IERC20(token).balanceOf(address(this));
-    }
-    
-    /**
-     * @dev Receive function to accept ETH
-     */
-    receive() external payable {
-        Allow contract to receive ETH
+    function getLockRecord(uint256 _id) external view returns (LockRecord memory) {
+        return lockRecords[_id];
     }
 }
-// 
-Contract End
-// 
